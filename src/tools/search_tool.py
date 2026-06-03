@@ -1,6 +1,6 @@
 """
 Search Tool - Multi-source search with multiple fallback strategies.
-Sources: ddgs library → DDG HTML scrape → Wikipedia REST API → Wikipedia-api library
+Sources: ddgs/duckduckgo_search library → DDG HTML scrape → DDG lite → Wikipedia REST API → Wikipedia-api library
 """
 import asyncio
 import re
@@ -9,17 +9,10 @@ from typing import Optional
 from loguru import logger
 
 try:
-    from ddgs import DDGS
+    from duckduckgo_search import DDGS
     DDG_AVAILABLE = True
-    DDG_NEW = True
 except ImportError:
-    try:
-        from duckduckgo_search import DDGS
-        DDG_AVAILABLE = True
-        DDG_NEW = False
-    except ImportError:
-        DDG_AVAILABLE = False
-        DDG_NEW = False
+    DDG_AVAILABLE = False
 
 try:
     import wikipediaapi
@@ -63,7 +56,7 @@ class SearchTool:
                 logger.warning(f"Wikipedia-api init failed: {e}")
 
         logger.info(
-            f"SearchTool initialized | DDG={DDG_AVAILABLE} (new={DDG_NEW}) | "
+            f"SearchTool initialized | DDG={DDG_AVAILABLE} | "
             f"WikiLib={WIKI_LIB_AVAILABLE} | Scraping={SCRAPING_AVAILABLE}"
         )
 
@@ -73,8 +66,7 @@ class SearchTool:
         """Search all sources with fallbacks."""
         results = []
 
-        # Run DDG + Wikipedia in parallel
-        ddg_task = asyncio.create_task(self._search_ddg_all_methods(query, max_results - 1))
+        ddg_task  = asyncio.create_task(self._search_ddg_all_methods(query, max_results - 1))
         wiki_task = asyncio.create_task(self._search_wikipedia_all_methods(query))
 
         ddg_results, wiki_results = await asyncio.gather(ddg_task, wiki_task, return_exceptions=True)
@@ -84,7 +76,6 @@ class SearchTool:
         if isinstance(wiki_results, list):
             results.extend(wiki_results)
 
-        # Deduplicate by URL
         seen, unique = set(), []
         for r in results:
             if r.url not in seen:
@@ -97,8 +88,6 @@ class SearchTool:
     # ── DDG: 3 methods ──────────────────────────────────────────
 
     async def _search_ddg_all_methods(self, query: str, max_results: int) -> list[SearchResult]:
-        """Try ddgs library → DDG HTML → DDG lite."""
-
         results = await self._ddg_library(query, max_results)
         if results:
             return results
@@ -109,8 +98,7 @@ class SearchTool:
             return results
 
         logger.info("DDG HTML returned 0, trying lite...")
-        results = await self._ddg_lite_scrape(query, max_results)
-        return results
+        return await self._ddg_lite_scrape(query, max_results)
 
     async def _ddg_library(self, query: str, max_results: int) -> list[SearchResult]:
         if not DDG_AVAILABLE:
@@ -127,7 +115,7 @@ class SearchTool:
                 SearchResult(
                     title=item.get("title", ""),
                     url=item.get("href", "") or item.get("url", ""),
-                    snippet=item.get("body", "") [:500],
+                    snippet=item.get("body", "")[:500],
                     source_type="web"
                 )
                 for item in raw if item.get("href") or item.get("url")
@@ -185,7 +173,7 @@ class SearchTool:
             rows = soup.find_all("tr")
             i = 0
             while i < len(rows) and len(results) < max_results:
-                row = rows[i]
+                row  = rows[i]
                 link = row.find("a", {"class": "result-link"}) or row.find("a")
                 if link and link.get("href", "").startswith("http"):
                     title   = link.get_text(strip=True)
@@ -214,7 +202,7 @@ class SearchTool:
         if not SCRAPING_AVAILABLE:
             return []
         try:
-            encoded = urllib.parse.quote_plus(query)
+            encoded    = urllib.parse.quote_plus(query)
             search_url = (
                 f"https://en.wikipedia.org/w/api.php"
                 f"?action=query&list=search&srsearch={encoded}"
@@ -235,7 +223,6 @@ class SearchTool:
                         "https://en.wikipedia.org/wiki/"
                         + urllib.parse.quote(title.replace(" ", "_"))
                     )
-                    # Try to fetch a richer summary
                     try:
                         sum_url = (
                             "https://en.wikipedia.org/api/rest_v1/page/summary/"
