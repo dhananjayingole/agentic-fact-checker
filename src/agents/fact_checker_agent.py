@@ -2,7 +2,7 @@
 Fact Checker Agent - Orchestrates the full verification pipeline.
 
 Pipeline:
-  1. Search (DuckDuckGo + Wikipedia)
+  1. Search (Tavily primary, DuckDuckGo + Wikipedia fallback)
   2. Evidence analysis (relevance + stance scoring)
   3. Content enrichment (optional page scraping)
   4. LLM judgment (Groq)
@@ -58,6 +58,17 @@ class FactCheckerAgent:
         # ── Step 2: Evidence Analysis ──────────────────────────
         evidence_items = self.evidence_analyzer.analyze(search_results, claim)
         logger.info(f"Produced {len(evidence_items)} evidence items")
+
+        # Guard: search returned results, but none were relevant to the claim.
+        # Do NOT hand irrelevant snippets to the LLM — it will hallucinate a
+        # verdict from unrelated context (e.g. judging "Humans have three lungs"
+        # off Vietnamese-cuisine articles). Fail closed to UNVERIFIABLE instead.
+        if not evidence_items:
+            logger.warning(
+                f"Search returned {len(search_results)} results but none were "
+                f"relevant evidence for: {claim[:80]}"
+            )
+            return self._no_evidence_response(claim, start_time, sources_searched=len(search_results))
 
         # ── Step 3: Content Enrichment (best-effort scraping) ──
         # Only scrape top 3 results to keep latency low
@@ -130,17 +141,17 @@ class FactCheckerAgent:
         except Exception as e:
             logger.debug(f"Background Neo4j store failed: {e}")
 
-    def _no_evidence_response(self, claim: str, start_time: float) -> VerifyResponse:
+    def _no_evidence_response(self, claim: str, start_time: float, sources_searched: int = 0) -> VerifyResponse:
         return VerifyResponse(
             claim=claim,
             verdict=Verdict.UNVERIFIABLE,
             confidence_score=5.0,
             evidence_count=0,
             evidence_list=[],
-            evidence_summary="No evidence found for this claim.",
-            reasoning="Search returned no results. The claim cannot be verified.",
+            evidence_summary="No relevant evidence found for this claim.",
+            reasoning="Search did not return evidence relevant to this claim. The claim cannot be verified.",
             processing_time_seconds=round(time.time() - start_time, 2),
-            sources_searched=0,
+            sources_searched=sources_searched,
         )
 
     def _error_response(self, claim: str, error: str) -> VerifyResponse:
@@ -161,6 +172,5 @@ class FactCheckerAgent:
         return {
             "groq_llm": "connected" if self.groq_service.is_available() else "heuristic_mode",
             "neo4j": "connected" if self.neo4j_service.is_available() else "disabled",
-            "duckduckgo": "enabled",
-            "wikipedia": "enabled",
+            "search": "tavily" if getattr(self.search_tool, "tavily_client", None) else "ddg_wikipedia_fallback",
         }

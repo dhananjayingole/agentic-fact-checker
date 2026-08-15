@@ -1,6 +1,6 @@
 """
 Groq LLM Service - Handles all LLM interactions using Groq's free API.
-Model: llama3-8b-8192 (fast, free, accurate)
+Model: llama-3.3-70b-versatile
 """
 import json
 import os
@@ -98,6 +98,7 @@ Respond with ONLY valid JSON in this exact format:
                 result["confidence_score"] = float(
                     max(0.0, min(10.0, result.get("confidence_score", 5.0)))
                 )
+                result["method"] = "llm"
                 return result
         except Exception as e:
             logger.error(f"Groq API error: {e}")
@@ -138,13 +139,30 @@ Respond with ONLY valid JSON array:
         return self._simple_sentence_split(text)
 
     def _heuristic_verdict(self, claim: str, evidence_texts: list[str]) -> dict:
-        """Fallback: keyword-based heuristic when LLM is unavailable."""
+        """
+        Fallback: keyword-based heuristic when the LLM is unavailable (no API key,
+        or a transient Groq outage/rate-limit even after retries).
+
+        IMPORTANT: This is pure string matching with no semantic understanding —
+        it can be fooled by a negation word appearing anywhere in unrelated
+        context (e.g. "at higher altitudes it is lower" contains no trigger word,
+        but a source discussing an unrelated myth being "debunked" could trip a
+        false positive on a totally different claim that happens to share nouns).
+
+        Because of that, this fallback NEVER asserts a confident TRUE or FALSE
+        verdict. It only ever returns INCONCLUSIVE or UNVERIFIABLE, and always
+        flags itself as "method": "heuristic" so callers/UI can surface that this
+        verdict was not LLM-verified and should be treated with lower trust.
+        """
+        result_method = {"method": "heuristic"}
+
         if not evidence_texts:
             return {
                 "verdict": "INCONCLUSIVE",
                 "confidence_score": 5.0,
                 "reasoning": "No evidence found to verify this claim.",
-                "summary": "Could not find sufficient evidence to verify or refute this claim."
+                "summary": "Could not find sufficient evidence to verify or refute this claim.",
+                **result_method,
             }
 
         claim_lower = claim.lower()
@@ -166,33 +184,50 @@ Respond with ONLY valid JSON array:
             for pos in ["confirmed", "correct", "true", "accurate", "verified", "proven"]
         )
 
+        # NOTE: previously these two branches asserted FALSE / TRUE directly.
+        # That is not safe for a keyword-only heuristic (no semantic understanding
+        # of negation scope, sarcasm, or unrelated context). Downgraded to
+        # INCONCLUSIVE with a lean noted in the reasoning, so the UI/agent layer
+        # can decide how to treat it rather than presenting a false-confidence verdict.
         if negation_in_evidence and overlap_ratio > 0.3:
             return {
-                "verdict": "FALSE",
-                "confidence_score": 3.0,
-                "reasoning": "Evidence found contains language suggesting the claim is incorrect.",
-                "summary": "Evidence suggests this claim may be false."
+                "verdict": "INCONCLUSIVE",
+                "confidence_score": 4.0,
+                "reasoning": (
+                    "Heuristic fallback (LLM unavailable): evidence contains language that "
+                    "may suggest the claim is incorrect, but this was not confirmed by an LLM "
+                    "and should not be treated as a confident verdict."
+                ),
+                "summary": "Evidence leans against this claim, but verification requires LLM review.",
+                **result_method,
             }
         elif confirmation_in_evidence and overlap_ratio > 0.3:
             return {
-                "verdict": "TRUE",
-                "confidence_score": 7.0,
-                "reasoning": "Evidence found contains language supporting the claim.",
-                "summary": "Evidence suggests this claim is likely true."
+                "verdict": "INCONCLUSIVE",
+                "confidence_score": 6.0,
+                "reasoning": (
+                    "Heuristic fallback (LLM unavailable): evidence contains language that "
+                    "may support the claim, but this was not confirmed by an LLM and should "
+                    "not be treated as a confident verdict."
+                ),
+                "summary": "Evidence leans toward this claim, but verification requires LLM review.",
+                **result_method,
             }
         elif overlap_ratio > 0.4:
             return {
                 "verdict": "INCONCLUSIVE",
                 "confidence_score": 5.0,
                 "reasoning": "Evidence found but verdict unclear without LLM analysis.",
-                "summary": "Related evidence found but a definitive verdict requires manual review."
+                "summary": "Related evidence found but a definitive verdict requires manual review.",
+                **result_method,
             }
         else:
             return {
                 "verdict": "UNVERIFIABLE",
                 "confidence_score": 5.0,
                 "reasoning": "Insufficient relevant evidence found to verify or refute this claim.",
-                "summary": "Not enough evidence found to make a determination."
+                "summary": "Not enough evidence found to make a determination.",
+                **result_method,
             }
 
     def _simple_sentence_split(self, text: str) -> list[str]:

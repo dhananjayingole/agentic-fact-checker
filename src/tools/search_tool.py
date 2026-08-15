@@ -1,18 +1,37 @@
 """
 Search Tool - Multi-source search with multiple fallback strategies.
-Sources: ddgs/duckduckgo_search library → DDG HTML scrape → DDG lite → Wikipedia REST API → Wikipedia-api library
+Primary: Tavily API (reliable from any IP, including cloud/datacenter hosts like Render)
+Fallback sources: ddgs/duckduckgo_search library -> DDG HTML scrape -> DDG lite -> Wikipedia REST API -> Wikipedia-api library
+
+Why Tavily is primary: DuckDuckGo and Wikipedia's search endpoints throttle/block
+requests coming from known datacenter IP ranges (Render, AWS, Heroku, etc). This is
+an IP-reputation issue, not a package or code bug -- confirmed by Render logs showing
+0 results / irrelevant results even after fixing DDG import errors. Tavily is a paid
+API (free tier available) that authenticates via API key, so it isn't subject to the
+same scraping-detection blocking.
 """
 import asyncio
+import os
 import re
 import urllib.parse
 from typing import Optional
 from loguru import logger
 
 try:
+    from tavily import TavilyClient
+    TAVILY_LIB_AVAILABLE = True
+except ImportError:
+    TAVILY_LIB_AVAILABLE = False
+
+try:
     from duckduckgo_search import DDGS
     DDG_AVAILABLE = True
 except ImportError:
-    DDG_AVAILABLE = False
+    try:
+        from ddgs import DDGS
+        DDG_AVAILABLE = True
+    except ImportError:
+        DDG_AVAILABLE = False
 
 try:
     import wikipediaapi
@@ -31,7 +50,7 @@ from src.models.schemas import SearchResult
 
 
 class SearchTool:
-    """Multi-source search with cascading fallbacks."""
+    """Search with Tavily as the primary reliable source, DDG/Wikipedia as fallback."""
 
     HEADERS = {
         "User-Agent": (
@@ -44,6 +63,18 @@ class SearchTool:
     }
 
     def __init__(self):
+        # ── Tavily (primary) ────────────────────────────────────
+        self.tavily_client = None
+        tavily_key = os.getenv("TAVILY_API_KEY")
+        if TAVILY_LIB_AVAILABLE and tavily_key:
+            try:
+                self.tavily_client = TavilyClient(api_key=tavily_key)
+            except Exception as e:
+                logger.warning(f"Tavily client init failed: {e}")
+        elif TAVILY_LIB_AVAILABLE and not tavily_key:
+            logger.warning("TAVILY_API_KEY not set — Tavily search disabled, using fallback chain only")
+
+        # ── Wikipedia lib (fallback) ────────────────────────────
         self.wiki = None
         if WIKI_LIB_AVAILABLE:
             try:
@@ -56,14 +87,22 @@ class SearchTool:
                 logger.warning(f"Wikipedia-api init failed: {e}")
 
         logger.info(
-            f"SearchTool initialized | DDG={DDG_AVAILABLE} | "
-            f"WikiLib={WIKI_LIB_AVAILABLE} | Scraping={SCRAPING_AVAILABLE}"
+            f"SearchTool initialized | Tavily={self.tavily_client is not None} | "
+            f"DDG={DDG_AVAILABLE} | WikiLib={WIKI_LIB_AVAILABLE} | Scraping={SCRAPING_AVAILABLE}"
         )
 
     # ── Main entry point ────────────────────────────────────────
 
     async def search_all(self, query: str, max_results: int = 5) -> list[SearchResult]:
-        """Search all sources with fallbacks."""
+        """Search using Tavily first (reliable from any IP); fall back to DDG/Wikipedia scraping."""
+
+        if self.tavily_client:
+            tavily_results = await self._search_tavily(query, max_results)
+            if tavily_results:
+                logger.info(f"Total unique results for '{query[:50]}': {len(tavily_results)} (via Tavily)")
+                return tavily_results[:max_results]
+            logger.warning(f"Tavily returned 0 results for '{query[:50]}', falling back to DDG/Wikipedia")
+
         results = []
 
         ddg_task  = asyncio.create_task(self._search_ddg_all_methods(query, max_results - 1))
@@ -82,10 +121,41 @@ class SearchTool:
                 seen.add(r.url)
                 unique.append(r)
 
-        logger.info(f"Total unique results for '{query[:50]}': {len(unique)}")
+        logger.info(f"Total unique results for '{query[:50]}': {len(unique)} (via DDG/Wikipedia fallback)")
         return unique[:max_results]
 
-    # ── DDG: 3 methods ──────────────────────────────────────────
+    # ── Tavily ───────────────────────────────────────────────────
+
+    async def _search_tavily(self, query: str, max_results: int) -> list[SearchResult]:
+        if not self.tavily_client:
+            return []
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _search():
+                return self.tavily_client.search(
+                    query=query,
+                    max_results=max_results,
+                    search_depth="basic",
+                )
+
+            raw = await asyncio.wait_for(loop.run_in_executor(None, _search), timeout=15)
+            results = [
+                SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    snippet=(item.get("content", "") or "")[:500],
+                    source_type="web",
+                )
+                for item in raw.get("results", []) if item.get("url")
+            ]
+            logger.info(f"Tavily: {len(results)} results")
+            return results
+        except Exception as e:
+            logger.warning(f"Tavily search failed: {e}")
+            return []
+
+    # ── DDG: 3 methods (fallback) ───────────────────────────────
 
     async def _search_ddg_all_methods(self, query: str, max_results: int) -> list[SearchResult]:
         results = await self._ddg_library(query, max_results)
@@ -189,7 +259,7 @@ class SearchTool:
             logger.warning(f"DDG lite failed: {e}")
             return []
 
-    # ── Wikipedia: 2 methods ────────────────────────────────────
+    # ── Wikipedia: 2 methods (fallback) ─────────────────────────
 
     async def _search_wikipedia_all_methods(self, query: str) -> list[SearchResult]:
         results = await self._wikipedia_rest_api(query)
@@ -198,7 +268,7 @@ class SearchTool:
         return await self._wikipedia_lib(query)
 
     async def _wikipedia_rest_api(self, query: str) -> list[SearchResult]:
-        """Wikipedia public REST API — very reliable, no key needed."""
+        """Wikipedia public REST API."""
         if not SCRAPING_AVAILABLE:
             return []
         try:
